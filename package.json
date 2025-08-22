@@ -1,0 +1,34 @@
+{
+  "name": "selini-task",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start:dev": "ts-node src/index.ts",
+    "test-solscan": "ts-node src/lib/test.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nischayBlockx/selini-task.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/nischayBlockx/selini-task/issues"
+  },
+  "homepage": "https://github.com/nischayBlockx/selini-task#readme",
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.13",
+    "@solana/web3.js": "^1.98.4",
+    "axios": "^1.11.0",
+    "dotenv": "^17.2.1",
+    "ts-node": "^10.9.2"
+  }
+}
