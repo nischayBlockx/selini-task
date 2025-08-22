@@ -10,6 +10,7 @@ export interface WalletClassification {
   transactionCount: number;
   hasSold: boolean;
   isDiamondHand: boolean;
+  isLongTermNoOutflow180?: boolean;
   metadata?: {
     label?: string;
     source: "automated_classification";
@@ -22,6 +23,7 @@ export interface WalletHistorySummary {
   txCount: number;
   hasSold: boolean;
   netFlow: number; // +ve = net in, -ve = net out
+  lastOutflowAt: Date | null;
 }
 
 export interface HolderInfo {

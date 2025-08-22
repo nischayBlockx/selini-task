@@ -87,6 +87,7 @@ export class SolanaLib {
   async classifyTokenHolders(
     tokenMint: string,
   ): Promise<WalletClassification[]> {
+    const DAY_MS = 24 * 60 * 60 * 1000;
     const mintInfo = await this.getMintInfo(
       typeof tokenMint === "string" ? new PublicKey(tokenMint) : tokenMint,
     );
@@ -127,9 +128,12 @@ export class SolanaLib {
       );
 
       // Determine if diamond hand (never sold, held for >6 months)
-      const ageDays =
-        (Date.now() - history.firstTx.getTime()) / (1000 * 60 * 60 * 24);
-      const isDiamondHand = !history.hasSold && ageDays > 180;
+      const ageDays = (Date.now() - history.firstTx.getTime()) / DAY_MS;
+      const isDiamondHand = !history.hasSold && ageDays >= 90;
+      const isLongTermNoOutflow180 =
+        ageDays >= 180 &&
+        (!history.lastOutflowAt ||
+          Date.now() - history.lastOutflowAt.getTime() >= 180 * DAY_MS);
 
       const solscanLabel =
         (await this.getAccountLabel(holder.address)) || undefined;
@@ -143,6 +147,7 @@ export class SolanaLib {
         transactionCount: history.txCount,
         hasSold: history.hasSold,
         isDiamondHand,
+        isLongTermNoOutflow180,
         metadata: {
           label: solscanLabel,
           source: "automated_classification",
@@ -228,23 +233,31 @@ export class SolanaLib {
     lastTx: Date;
     txCount: number;
     hasSold: boolean;
-    netFlow: number; // UI units
+    netFlow: number;
+    lastOutflowAt: Date | null; // NEW
   }> {
     console.log(
       `Analyzing wallet history for ${walletAddress} on token ${tokenMint}...`,
     );
-
     try {
-      // Detect if walletAddress is actually a token account; if so, get its owner
+      let allTransfers: any[] = [];
+      const url = `https://pro-api.solscan.io/v2.0/account/transfer`;
+      const headers = {
+        token: CONFIG.SOLSCAN_API_KEY,
+        "Content-Type": "application/json",
+      };
+      let currentPage = 1;
+      let hasMore = true;
+      const pageSize = 100;
+
+      // If the address is actually a token account, lift the owner (wallet) and pass token_account
       let ownerAddress = walletAddress;
       let tokenAccountParam: string | undefined;
-
       try {
         const info = await this.connection.getParsedAccountInfo(
           new PublicKey(walletAddress),
         );
         const parsed: any = info.value?.data as any;
-
         const isSplTokenAccount =
           parsed &&
           parsed.program === "spl-token" &&
@@ -253,83 +266,88 @@ export class SolanaLib {
 
         if (isSplTokenAccount) {
           tokenAccountParam = walletAddress;
-          ownerAddress = parsed.parsed.info.owner; // wallet address
+          ownerAddress = parsed.parsed.info.owner;
         }
       } catch (_) {
-        // ignore; treat as a normal wallet address
+        // treat as wallet address
       }
-
-      const url = "https://pro-api.solscan.io/v2.0/account/transfer";
-      const headers = { token: CONFIG.SOLSCAN_API_KEY };
 
       const activityTypes = [
         "ACTIVITY_SPL_TRANSFER",
         "ACTIVITY_SPL_MINT",
         "ACTIVITY_SPL_CREATE_ACCOUNT",
         "ACTIVITY_SPL_BURN",
-      ]; // valid enums per docs
+      ];
 
-      const pageSize = 100;
-      let page = 1;
-      const rows: any[] = [];
-
-      while (true) {
+      while (hasMore && allTransfers.length < 1000) {
         const params: any = {
-          address: ownerAddress, // must be a wallet address
-          token: tokenMint, // filter by this mint
-          activity_type: activityTypes, // transfers/mints/burns
+          address: ownerAddress,
+          token: tokenMint,
+          activity_type: activityTypes,
           exclude_amount_zero: true,
           sort_by: "block_time",
           sort_order: "desc",
-          page,
+          page: currentPage,
           page_size: pageSize,
         };
+        if (tokenAccountParam) params.token_account = tokenAccountParam;
 
-        if (tokenAccountParam) {
-          params.token_account = tokenAccountParam; // constrain to that token account
+        const response = await axios.get(url, { headers, params });
+        if (!response.data?.success) break;
+
+        const transfers: any[] = response.data.data ?? [];
+        if (transfers.length === 0) {
+          hasMore = false;
+          break;
         }
 
-        const { data } = await axios.get(url, { headers, params });
-        if (!data?.success) break;
-
-        const pageItems: any[] = data.data ?? [];
-        if (pageItems.length === 0) break;
-
-        rows.push(...pageItems);
-        if (pageItems.length < pageSize) break;
-
-        page += 1;
-        await new Promise((r) => setTimeout(r, 200));
+        allTransfers.push(...transfers);
+        currentPage++;
+        await new Promise((resolve) => setTimeout(resolve, 200));
       }
 
-      if (rows.length === 0) {
+      if (allTransfers.length === 0) {
         return {
           firstTx: new Date(),
           lastTx: new Date(),
           txCount: 0,
           hasSold: false,
           netFlow: 0,
+          lastOutflowAt: null,
         };
       }
 
-      // Chronological order
-      rows.sort((a, b) => a.block_time - b.block_time);
+      // oldest -> newest
+      allTransfers.sort((a, b) => a.block_time - b.block_time);
 
-      let inflow = 0;
-      let outflow = 0;
-      for (const tx of rows) {
+      let totalInflow = 0;
+      let totalOutflow = 0;
+      let lastOutflowAt: Date | null = null;
+
+      for (const tx of allTransfers) {
         const dec = Number(tx.token_decimals ?? 0);
-        const amtUi = Number(tx.amount) / Math.pow(10, dec); // docs: divide by 10^dec
-        if (tx.flow === "out") outflow += amtUi;
-        else if (tx.flow === "in") inflow += amtUi;
+        const amtUi = Number(tx.amount) / Math.pow(10, dec);
+
+        if (tx.flow === "out") {
+          totalOutflow += amtUi;
+          const t = new Date(tx.block_time * 1000);
+          if (!lastOutflowAt || t.getTime() > lastOutflowAt.getTime()) {
+            lastOutflowAt = t;
+          }
+        } else if (tx.flow === "in") {
+          totalInflow += amtUi;
+        }
       }
 
       return {
-        firstTx: new Date(rows[0].block_time * 1000),
-        lastTx: new Date(rows[rows.length - 1].block_time * 1000),
-        txCount: rows.length,
-        hasSold: outflow > 0,
-        netFlow: inflow - outflow,
+        firstTx: new Date(allTransfers[0].block_time * 1000),
+        lastTx: new Date(
+          allTransfers[allTransfers.length - 1].block_time * 1000,
+        ),
+        txCount: allTransfers.length,
+        hasSold: totalOutflow > 0,
+        netFlow: totalInflow - totalOutflow,
+        lastOutflowAt,
       };
     } catch (error) {
       console.error(`Error analyzing wallet ${walletAddress}:`, error);
@@ -339,6 +357,7 @@ export class SolanaLib {
         txCount: 0,
         hasSold: false,
         netFlow: 0,
+        lastOutflowAt: null,
       };
     }
   }
