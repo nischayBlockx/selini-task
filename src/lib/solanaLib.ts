@@ -228,60 +228,81 @@ export class SolanaLib {
     lastTx: Date;
     txCount: number;
     hasSold: boolean;
-    netFlow: number;
+    netFlow: number; // UI units
   }> {
     console.log(
       `Analyzing wallet history for ${walletAddress} on token ${tokenMint}...`,
     );
-    try {
-      let allTransfers: any[] = [];
-      const url = `https://pro-api.solscan.io/v2.0/account/transfer`;
-      const headers = {
-        token: CONFIG.SOLSCAN_API_KEY,
-        "Content-Type": "application/json",
-      };
-      let currentPage = 1;
-      let hasMore = true;
-      const pageSize = 100;
 
-      while (hasMore && allTransfers.length < 1000) {
+    try {
+      // Detect if walletAddress is actually a token account; if so, get its owner
+      let ownerAddress = walletAddress;
+      let tokenAccountParam: string | undefined;
+
+      try {
+        const info = await this.connection.getParsedAccountInfo(
+          new PublicKey(walletAddress),
+        );
+        const parsed: any = info.value?.data as any;
+
+        const isSplTokenAccount =
+          parsed &&
+          parsed.program === "spl-token" &&
+          parsed.parsed?.type === "account" &&
+          parsed.parsed?.info?.owner;
+
+        if (isSplTokenAccount) {
+          tokenAccountParam = walletAddress;
+          ownerAddress = parsed.parsed.info.owner; // wallet address
+        }
+      } catch (_) {
+        // ignore; treat as a normal wallet address
+      }
+
+      const url = "https://pro-api.solscan.io/v2.0/account/transfer";
+      const headers = { token: CONFIG.SOLSCAN_API_KEY };
+
+      const activityTypes = [
+        "ACTIVITY_SPL_TRANSFER",
+        "ACTIVITY_SPL_MINT",
+        "ACTIVITY_SPL_CREATE_ACCOUNT",
+        "ACTIVITY_SPL_BURN",
+      ]; // valid enums per docs
+
+      const pageSize = 100;
+      let page = 1;
+      const rows: any[] = [];
+
+      while (true) {
         const params: any = {
-          address: walletAddress, // Fixed: was 'walletAddress', should be 'address'
-          // Remove token parameter as it might not be supported
-          // token: tokenMint,
-          page: currentPage,
-          page_size: pageSize,
-          activity_type: ["ACTIVITY_SPL_TRANSFER"],
+          address: ownerAddress, // must be a wallet address
+          token: tokenMint, // filter by this mint
+          activity_type: activityTypes, // transfers/mints/burns
           exclude_amount_zero: true,
           sort_by: "block_time",
           sort_order: "desc",
+          page,
+          page_size: pageSize,
         };
 
-        const response = await axios.get(url, { headers, params });
-
-        if (!response.data.success) {
-          console.error("SOLSCAN API returned error:", response.data);
-          break;
+        if (tokenAccountParam) {
+          params.token_account = tokenAccountParam; // constrain to that token account
         }
 
-        const transfers = response.data.data || [];
+        const { data } = await axios.get(url, { headers, params });
+        if (!data?.success) break;
 
-        if (transfers.length === 0) {
-          hasMore = false;
-          break;
-        }
+        const pageItems: any[] = data.data ?? [];
+        if (pageItems.length === 0) break;
 
-        // Filter by token mint after fetching (since API might not support direct token filtering)
-        const tokenTransfers = transfers.filter(
-          (tx: any) => tx.token_address === tokenMint,
-        );
+        rows.push(...pageItems);
+        if (pageItems.length < pageSize) break;
 
-        allTransfers = allTransfers.concat(tokenTransfers);
-        currentPage++;
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        page += 1;
+        await new Promise((r) => setTimeout(r, 200));
       }
 
-      if (allTransfers.length === 0) {
+      if (rows.length === 0) {
         return {
           firstTx: new Date(),
           lastTx: new Date(),
@@ -291,30 +312,24 @@ export class SolanaLib {
         };
       }
 
-      // Sort ascending by block_time to get true first/last
-      allTransfers.sort((a, b) => a.block_time - b.block_time);
+      // Chronological order
+      rows.sort((a, b) => a.block_time - b.block_time);
 
-      let totalInflow = 0;
-      let totalOutflow = 0;
-      let hasSold = false;
-
-      allTransfers.forEach((tx: any) => {
-        if (tx.flow === "out") {
-          totalOutflow += tx.amount;
-          hasSold = true;
-        } else if (tx.flow === "in") {
-          totalInflow += tx.amount;
-        }
-      });
+      let inflow = 0;
+      let outflow = 0;
+      for (const tx of rows) {
+        const dec = Number(tx.token_decimals ?? 0);
+        const amtUi = Number(tx.amount) / Math.pow(10, dec); // docs: divide by 10^dec
+        if (tx.flow === "out") outflow += amtUi;
+        else if (tx.flow === "in") inflow += amtUi;
+      }
 
       return {
-        firstTx: new Date(allTransfers[0].block_time * 1000),
-        lastTx: new Date(
-          allTransfers[allTransfers.length - 1].block_time * 1000,
-        ),
-        txCount: allTransfers.length,
-        hasSold,
-        netFlow: totalInflow - totalOutflow,
+        firstTx: new Date(rows[0].block_time * 1000),
+        lastTx: new Date(rows[rows.length - 1].block_time * 1000),
+        txCount: rows.length,
+        hasSold: outflow > 0,
+        netFlow: inflow - outflow,
       };
     } catch (error) {
       console.error(`Error analyzing wallet ${walletAddress}:`, error);
