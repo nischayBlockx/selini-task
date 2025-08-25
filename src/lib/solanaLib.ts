@@ -1,15 +1,30 @@
-import { getMint, Mint } from "@solana/spl-token";
+import { getMint, Mint, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import axios from "axios";
-import { Connection, PublicKey } from "@solana/web3.js";
+import { AccountTypeClassifier } from "./walletClassifier";
+import { Connection, PublicKey, ParsedAccountData } from "@solana/web3.js";
 import {
   MintInfo,
   SolscanMetaDataResponse,
   WalletClassification,
   HolderInfo,
   WalletHistorySummary,
+  ClassifyWalletContext,
+  SolscanAccountData,
 } from "../common/interface";
-import { WalletCategory } from "../common/constants";
+import {
+  WalletCategory,
+  DEX_KEYWORDS,
+  CEX_KEYWORDS,
+  AccountType
+} from "../common/constants";
 import { CONFIG } from "../config/config";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+
+export type GenerateOptions = {
+  outPath?: string;
+  includeFullSplit?: boolean;
+};
 
 export class SolanaLib {
   private connection: Connection;
@@ -44,42 +59,101 @@ export class SolanaLib {
     const mintKey =
       typeof mintAddr === "string" ? new PublicKey(mintAddr) : mintAddr;
 
-    // RPC returns up to 20 accounts sorted by balance (largest first)
+    // RPC returns up to 20 token accounts sorted by balance (largest first)
     const { value } = await this.connection.getTokenLargestAccounts(mintKey);
 
     // Filter out zero balances
     const nonEmpty = value.filter((e) => BigInt(e.amount) > 0n);
-    if (nonEmpty.length === 0) return null; // nothing left after filtering
+    if (nonEmpty.length === 0) return null;
 
-    return nonEmpty.map((entry) => {
-      const raw = BigInt(entry.amount);
-      return {
-        address: entry.address.toBase58(),
-        rawBalance: raw,
-        balance: Number(raw) / 10 ** entry.decimals,
-        decimals: entry.decimals,
-      };
-    });
+    // Enrich each token account with its owner wallet
+    const holders: HolderInfo[] = await Promise.all(
+      nonEmpty.map(async (entry) => {
+        const tokenAccountAddress = entry.address.toBase58();
+
+        const walletAddress = await this.getTokenAccountOwner(tokenAccountAddress);
+
+        const raw = BigInt(entry.amount);
+        return {
+          tokenAccount: tokenAccountAddress, // token account
+          walletAddress, // owner wallet
+          rawBalance: raw,
+          balance: Number(raw) / 10 ** entry.decimals,
+          decimals: entry.decimals,
+        };
+      }),
+    );
+
+    return holders;
   }
 
   // account labeling : https://docs.solscan.io/transaction-details/labeling
   // using Solscan's metadata API
-  async getAccountLabel(address: string): Promise<string | null> {
+  // async getAccountLabel(address: string): Promise<string | null> {
+  //   try {
+  //     const { data } = await axios.get<SolscanMetaDataResponse>(
+  //       "https://pro-api.solscan.io/v2.0/account/metadata",
+  //       {
+  //         params: { address },
+  //         headers: { token: CONFIG.SOLSCAN_API_KEY },
+  //       },
+  //     );
+  //     // Only return when the call itself succeeded and a label exists
+  //     return data.success && data.data?.account_label
+  //       ? data.data.account_label
+  //       : null;
+  //   } catch (err) {
+  //     return null;
+  //   }
+  // }
+
+  async getTokenAccountOwner(tokenAccount: string): Promise<string> {
+    try {
+      const info = await this.connection.getParsedAccountInfo(
+        new PublicKey(tokenAccount),
+      );
+      const parsed: any = info.value?.data as any;
+
+      const isSplTokenAccount =
+        parsed &&
+        parsed.program === "spl-token" &&
+        parsed.parsed?.type === "account" &&
+        parsed.parsed?.info?.owner;
+
+      if (isSplTokenAccount) {
+        return parsed.parsed.info.owner; // Return the owner wallet address
+      }
+
+      // If it's not a token account, assume it's already a wallet address
+      return tokenAccount;
+    } catch (error) {
+      console.warn(`Failed to get token account owner for ${tokenAccount}:`, error);
+      // Return the original address if parsing fails
+      return tokenAccount;
+    }
+  }
+
+  async getAccountMetadata(address: string): Promise<SolscanAccountData | null> {
     try {
       const { data } = await axios.get<SolscanMetaDataResponse>(
-        "https://public-api.solscan.io/account/metadata",
+        "https://pro-api.solscan.io/v2.0/account/metadata",
         {
           params: { address },
           headers: { token: CONFIG.SOLSCAN_API_KEY },
         },
       );
-      // Only return when the call itself succeeded and a label exists
-      return data.success && data.data?.account_label
-        ? data.data.account_label
-        : null;
+
+      // Return the full data object when successful
+      return data.success && data.data ? data.data : null;
     } catch (err) {
       return null;
     }
+  }
+
+  // Keep the original method for backward compatibility
+  async getAccountLabel(address: string): Promise<string | null> {
+    const metadata = await this.getAccountMetadata(address);
+    return metadata?.account_label || null;
   }
 
   /** Analyse the 20 largest on-chain holders (non-empty accounts) and
@@ -88,143 +162,161 @@ export class SolanaLib {
     tokenMint: string,
   ): Promise<WalletClassification[]> {
     const DAY_MS = 24 * 60 * 60 * 1000;
-    const mintInfo = await this.getMintInfo(
-      typeof tokenMint === "string" ? new PublicKey(tokenMint) : tokenMint,
-    );
-    const supplyRaw = mintInfo.raw.supply;
-    console.log(
-      `Token Mint: ${mintInfo.address}, Supply: ${mintInfo.supply}, Decimals: ${mintInfo.decimals}`,
-    );
 
-    console.log("Fetching top token holders...");
-    const holders = await this.getTopHolders(tokenMint);
-    if (!holders) {
-      console.log("No holders on this Token yet.");
-    } else {
-      console.log("Top Holders:", holders);
-    }
-    console.log(`Found ${holders?.length || 0} non-empty holders.`);
+    try {
+      // Get mint info
+      const mintInfo = await this.getMintInfo(
+        typeof tokenMint === "string" ? new PublicKey(tokenMint) : tokenMint,
+      );
+      const supplyRaw = mintInfo.raw.supply;
 
-    const classifications: WalletClassification[] = [];
-
-    if (!holders || holders.length === 0) {
-      return classifications; // No holders to classify
-    }
-
-    for (const holder of holders) {
-      // Get transaction history
-      const history: WalletHistorySummary = await this.analyzeWalletHistory(
-        holder.address,
-        tokenMint,
+      console.log(
+        `Token Mint: ${mintInfo.address}, Supply: ${mintInfo.supply}, Decimals: ${mintInfo.decimals}`,
       );
 
-      // Classify the wallet
-      const category = await this.classifyWallet(
-        holder.address,
-        holder.balance, // ui number
-        holder.rawBalance, // bigint
-        supplyRaw, // bigint
-        history,
-      );
+      // Get top holders
+      console.log("Fetching top token holders...");
+      const holders = await this.getTopHolders(tokenMint);
 
-      // Determine if diamond hand (never sold, held for >6 months)
-      const ageDays = (Date.now() - history.firstTx.getTime()) / DAY_MS;
-      const isDiamondHand = !history.hasSold && ageDays >= 90;
-      const isLongTermNoOutflow180 =
-        ageDays >= 180 &&
-        (!history.lastOutflowAt ||
-          Date.now() - history.lastOutflowAt.getTime() >= 180 * DAY_MS);
+      if (!holders || holders.length === 0) {
+        console.error("Error: Failed to fetch top token holders or no holders found.");
+        return [];
+      }
 
-      const solscanLabel =
-        (await this.getAccountLabel(holder.address)) || undefined;
+      console.log(`Found ${holders.length} token holders to classify`);
+      const classifications: WalletClassification[] = [];
 
-      classifications.push({
-        address: holder.address,
-        category,
-        balance: holder.balance,
-        firstTransactionDate: history.firstTx,
-        lastTransactionDate: history.lastTx,
-        transactionCount: history.txCount,
-        hasSold: history.hasSold,
-        isDiamondHand,
-        isLongTermNoOutflow180,
-        metadata: {
-          label: solscanLabel,
-          source: "automated_classification",
-        },
-      });
+      // Process each holder
+      for (const [index, holder] of holders.entries()) {
+        try {
+          console.log(`Processing holder ${index + 1}/${holders.length}...`);
 
-      // Rate limiting
-      await new Promise((resolve) => setTimeout(resolve, 100));
+          // 1. Resolve wallet address from token account if needed
+          const walletAddress = holder.walletAddress ||
+            await this.getTokenAccountOwner(holder.tokenAccount);
+
+          // 2. Analyze wallet transaction history
+          const history: WalletHistorySummary = await this.analyzeWalletHistory(
+            walletAddress,
+            tokenMint,
+          );
+
+          console.log(`Wallet ${walletAddress}: ${history.txCount} transactions, hasSold: ${history.hasSold}`);
+          const ownerMetadata = await this.getAccountMetadata(walletAddress);
+
+          if (ownerMetadata?.account_label || ownerMetadata?.account_tags?.length) {
+            console.log(
+              `Metadata found - Label: ${ownerMetadata.account_label}, Tags: ${ownerMetadata.account_tags?.join(', ')}`
+            );
+          }
+          const classification = AccountTypeClassifier.classifyAccount(ownerMetadata ?? null);
+
+          console.log(
+            `Account classification: ${classification.type} (${classification.confidence} confidence)`
+          );
+
+          // 5. Classify wallet category based on behavior + labels
+          const category = await this.classifyWallet(
+            walletAddress,
+            holder.balance,
+            holder.rawBalance,
+            supplyRaw,
+            history,
+            {
+              accountType: classification.type,
+              accountSubType: classification.subType,
+              classificationConfidence: classification.confidence,
+              isDex: classification.type === AccountType.DEX,
+              isCex: classification.type === AccountType.CEX,
+            }
+          );
+
+          // 6. Calculate diamond hand and long-term flags
+          const ageDays = (Date.now() - history.firstTx.getTime()) / DAY_MS;
+          const isDiamondHand = !history.hasSold && ageDays >= 90;
+          const isLongTermNoOutflow180 =
+            ageDays >= 180 &&
+            (!history.lastOutflowAt ||
+              Date.now() - history.lastOutflowAt.getTime() >= 180 * DAY_MS);
+
+          // 7. Build classification result
+          const walletClassification: WalletClassification = {
+            address: walletAddress,
+            category,
+            balance: holder.balance,
+            firstTransactionDate: history.firstTx,
+            lastTransactionDate: history.lastTx,
+            transactionCount: history.txCount,
+            hasSold: history.hasSold,
+            isDiamondHand,
+            isLongTermNoOutflow180,
+            metadata: {
+              // Basic identification
+              label: ownerMetadata?.account_label,
+              owner: walletAddress,
+              tokenAccount: holder.tokenAccount,
+              source: "automated_classification",
+
+              // Enhanced classification data
+              accountType: classification.type,
+              accountSubType: classification.subType,
+              classificationConfidence: classification.confidence,
+              classificationReasoning: classification.reasoning,
+
+              // Solscan metadata
+              accountTags: ownerMetadata?.account_tags || [],
+              activeAgeDays: ownerMetadata?.active_age,
+              fundedBy: ownerMetadata?.funded_by ? {
+                address: ownerMetadata.funded_by.funded_by,
+                txHash: ownerMetadata.funded_by.tx_hash,
+                fundedAt: new Date(ownerMetadata.funded_by.block_time * 1000),
+              } : undefined,
+
+              // Legacy fields for backward compatibility
+              isDex: classification.type === AccountType.DEX,
+              isCex: classification.type === AccountType.CEX,
+            },
+          };
+
+          classifications.push(walletClassification);
+
+          console.log(
+            `Classified ${walletAddress} as ${category} (${classification.type})`
+          );
+
+        } catch (error) {
+          console.error(
+            `Error processing holder ${holder.tokenAccount}:`,
+            error
+          );
+          // Continue processing other holders
+          continue;
+        }
+
+        // Rate limiting to avoid API throttling
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+
+      console.log(`Successfully classified ${classifications.length}/${holders.length} token holders`);
+
+      // Log summary statistics
+      const categoryCounts = classifications.reduce((acc, classification) => {
+        acc[classification.category] = (acc[classification.category] || 0) + 1;
+        return acc;
+      }, {} as Record<WalletCategory, number>);
+
+      console.log("Classification summary:", categoryCounts);
+
+      return classifications;
+
+    } catch (error) {
+      console.error("Error in classifyTokenHolders:", error);
+      throw error;
     }
-
-    return classifications;
   }
 
-  // async analyzeWalletHistory(
-  //   walletAddress: string,
-  //   tokenMint: string,
-  // ): Promise<{
-  //   firstTx: Date;
-  //   lastTx: Date;
-  //   txCount: number;
-  //   hasSold: boolean;
-  //   netFlow: number;
-  // }> {
-  //   try {
-  //     // Using Helius enhanced transactions API
-  //     const response = await axios.post(
-  //       `https://api.helius.xyz/v0/addresses/${walletAddress}/transactions?api-key=${CONFIG.HELIUS_API_KEY}`,
-  //       {
-  //         type: "TOKEN_TRANSFER",
-  //         mint: tokenMint,
-  //       },
-  //     );
 
-  //     const transactions = response.data || [];
 
-  //     if (transactions.length === 0) {
-  //       return {
-  //         firstTx: new Date(),
-  //         lastTx: new Date(),
-  //         txCount: 0,
-  //         hasSold: false,
-  //         netFlow: 0,
-  //       };
-  //     }
-
-  //     let totalInflow = 0;
-  //     let totalOutflow = 0;
-
-  //     transactions.forEach((tx: any) => {
-  //       if (tx.from === walletAddress) {
-  //         totalOutflow += tx.amount;
-  //       } else {
-  //         totalInflow += tx.amount;
-  //       }
-  //     });
-
-  //     return {
-  //       firstTx: new Date(
-  //         transactions[transactions.length - 1].timestamp * 1000,
-  //       ),
-  //       lastTx: new Date(transactions[0].timestamp * 1000),
-  //       txCount: transactions.length,
-  //       hasSold: totalOutflow > 0,
-  //       netFlow: totalInflow - totalOutflow,
-  //     };
-  //   } catch (error) {
-  //     console.error(`Error analyzing wallet ${walletAddress}:`, error);
-  //     return {
-  //       firstTx: new Date(),
-  //       lastTx: new Date(),
-  //       txCount: 0,
-  //       hasSold: false,
-  //       netFlow: 0,
-  //     };
-  //   }
-  // }
-  //
   async analyzeWalletHistory(
     walletAddress: string,
     tokenMint: string,
@@ -234,44 +326,16 @@ export class SolanaLib {
     txCount: number;
     hasSold: boolean;
     netFlow: number;
-    lastOutflowAt: Date | null; // NEW
+    lastOutflowAt: Date | null;
   }> {
-    console.log(
-      `Analyzing wallet history for ${walletAddress} on token ${tokenMint}...`,
-    );
     try {
-      let allTransfers: any[] = [];
-      const url = `https://pro-api.solscan.io/v2.0/account/transfer`;
+      const url = "https://pro-api.solscan.io/v2.0/account/transfer";
       const headers = {
         token: CONFIG.SOLSCAN_API_KEY,
         "Content-Type": "application/json",
       };
-      let currentPage = 1;
-      let hasMore = true;
-      const pageSize = 100;
 
-      // If the address is actually a token account, lift the owner (wallet) and pass token_account
       let ownerAddress = walletAddress;
-      let tokenAccountParam: string | undefined;
-      try {
-        const info = await this.connection.getParsedAccountInfo(
-          new PublicKey(walletAddress),
-        );
-        const parsed: any = info.value?.data as any;
-        const isSplTokenAccount =
-          parsed &&
-          parsed.program === "spl-token" &&
-          parsed.parsed?.type === "account" &&
-          parsed.parsed?.info?.owner;
-
-        if (isSplTokenAccount) {
-          tokenAccountParam = walletAddress;
-          ownerAddress = parsed.parsed.info.owner;
-        }
-      } catch (_) {
-        // treat as wallet address
-      }
-
       const activityTypes = [
         "ACTIVITY_SPL_TRANSFER",
         "ACTIVITY_SPL_MINT",
@@ -279,31 +343,37 @@ export class SolanaLib {
         "ACTIVITY_SPL_BURN",
       ];
 
-      while (hasMore && allTransfers.length < 1000) {
+      const pageSize = 100;
+      let page = 1;
+      const allTransfers: any[] = [];
+
+      while (allTransfers.length < 1000) {
         const params: any = {
-          address: ownerAddress,
-          token: tokenMint,
+          address: ownerAddress, // OWNER-level aggregation
+          token: tokenMint, // filter by this mint
           activity_type: activityTypes,
           exclude_amount_zero: true,
           sort_by: "block_time",
           sort_order: "desc",
-          page: currentPage,
+          page,
           page_size: pageSize,
         };
-        if (tokenAccountParam) params.token_account = tokenAccountParam;
 
-        const response = await axios.get(url, { headers, params });
-        if (!response.data?.success) break;
+        // IMPORTANT: do NOT set params.token_account (we want all accounts owned by the wallet)
 
-        const transfers: any[] = response.data.data ?? [];
-        if (transfers.length === 0) {
-          hasMore = false;
-          break;
-        }
+        const { data } = await axios.get(url, { headers, params });
+        if (!data?.success) break;
 
-        allTransfers.push(...transfers);
-        currentPage++;
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        const items: any[] = data.data ?? [];
+        if (items.length === 0) break;
+
+        allTransfers.push(...items);
+
+        if (items.length < pageSize) break;
+        page += 1;
+
+        // gentle rate limit
+        await new Promise((r) => setTimeout(r, 200));
       }
 
       if (allTransfers.length === 0) {
@@ -317,11 +387,11 @@ export class SolanaLib {
         };
       }
 
-      // oldest -> newest
+      // sort ascending to compute first/last accurately
       allTransfers.sort((a, b) => a.block_time - b.block_time);
 
-      let totalInflow = 0;
-      let totalOutflow = 0;
+      let inflow = 0;
+      let outflow = 0;
       let lastOutflowAt: Date | null = null;
 
       for (const tx of allTransfers) {
@@ -329,13 +399,13 @@ export class SolanaLib {
         const amtUi = Number(tx.amount) / Math.pow(10, dec);
 
         if (tx.flow === "out") {
-          totalOutflow += amtUi;
+          outflow += amtUi;
           const t = new Date(tx.block_time * 1000);
           if (!lastOutflowAt || t.getTime() > lastOutflowAt.getTime()) {
             lastOutflowAt = t;
           }
         } else if (tx.flow === "in") {
-          totalInflow += amtUi;
+          inflow += amtUi;
         }
       }
 
@@ -345,8 +415,8 @@ export class SolanaLib {
           allTransfers[allTransfers.length - 1].block_time * 1000,
         ),
         txCount: allTransfers.length,
-        hasSold: totalOutflow > 0,
-        netFlow: totalInflow - totalOutflow,
+        hasSold: outflow > 0,
+        netFlow: inflow - outflow,
         lastOutflowAt,
       };
     } catch (error) {
@@ -372,48 +442,648 @@ export class SolanaLib {
     balanceRaw: bigint,
     supplyRaw: bigint,
     history: WalletHistorySummary,
+    ctx: ClassifyWalletContext = {},
   ): Promise<WalletCategory> {
-    // Check Solscan Metadata labels
-    const solscanLabel = await this.getAccountLabel(address);
-    if (solscanLabel) {
-      const label = solscanLabel.toLowerCase();
-      if (
-        label.includes("exchange") ||
-        label.includes("binance") ||
-        label.includes("coinbase") ||
-        label.includes("ftx") ||
-        label.includes("kraken") ||
-        label.includes("okx")
-      ) {
-        return WalletCategory.Exchange;
+
+    // 1) HIGH-CONFIDENCE LABEL-BASED CLASSIFICATION FIRST
+    // These override behavioral patterns when we're confident
+    if (ctx.classificationConfidence === 'high' && ctx.accountType) {
+      switch (ctx.accountType) {
+        case AccountType.CEX:
+          return WalletCategory.Exchange;
+
+        case AccountType.DEX:
+          return WalletCategory.Dex;
+
+        case AccountType.BRIDGE:
+        case AccountType.STAKING:
+        case AccountType.PROGRAM_AUTHORITY:
+        case AccountType.VALIDATOR:
+          return WalletCategory.Infrastructure;
+
+        case AccountType.MARKET_MAKER:
+          return WalletCategory.MarketMaker;
+
+        // For other types (DEFI_PROTOCOL, NFT_MARKETPLACE), fall through to behavioral analysis
       }
     }
 
-    // Pattern-based classification
-    // Supply percentage
+    // 2) LEGACY SUPPORT (remove once fully migrated)
+    if (ctx.isCex) return WalletCategory.Exchange;
+    if (ctx.isDex) return WalletCategory.Dex;
+
+    // 3) BEHAVIORAL ANALYSIS FOR UNLABELED OR MEDIUM/LOW CONFIDENCE ACCOUNTS
+
     const pct = this.getSupplyPct(balanceRaw, supplyRaw);
+    const ageDays = (Date.now() - history.firstTx.getTime()) / (1000 * 60 * 60 * 24);
 
-    // foundation: > 5 % of supply and never sold
-    if (pct >= 5 && !history.hasSold) return WalletCategory.Foundation;
+    // Foundation: Large holder that never sold (likely project treasury)
+    if (pct >= 5 && !history.hasSold) {
+      return WalletCategory.Foundation;
+    }
 
-    // investor: 1–5 % supply, limited tx, older than 6 mo
-    const ageDays =
-      (Date.now() - history.firstTx.getTime()) / (1000 * 60 * 60 * 24);
-
+    // Investor: Medium holder with limited activity and age
     if (pct >= 1 && pct < 5 && history.txCount < 20 && ageDays > 180) {
       return WalletCategory.Investor;
     }
 
-    // team wallets: 0.1–1 % + vesting-like behaviour
+    // Team: Small-medium holder with vesting-like behavior
     if (pct >= 0.1 && pct < 1 && !history.hasSold && history.txCount < 50) {
       return WalletCategory.Team;
     }
 
-    // exchanges (behaviour based)
+    // Exchange (behavioral): High activity or large flow
+    // This catches unlabeled exchanges or exchange-like behavior
     if (history.txCount > 1_000 || Math.abs(history.netFlow) > 10_000_000) {
       return WalletCategory.Exchange;
     }
-    // default
+
+    // Market Maker (behavioral): Medium-high activity with balanced flow
+    // Detect potential MM behavior even without labels
+    if (history.txCount > 100 &&
+      Math.abs(history.netFlow) < balance * 0.1 && // Low net flow relative to balance
+      ageDays > 30) {
+      return WalletCategory.MarketMaker;
+    }
+
+    // 4) MEDIUM CONFIDENCE LABELS AS TIEBREAKERS
+    // If behavioral analysis doesn't catch anything, use medium confidence labels
+    if (ctx.classificationConfidence === 'medium' && ctx.accountType) {
+      switch (ctx.accountType) {
+        case AccountType.WHALE:
+          // Large balance whale -> likely investor
+          return pct >= 0.5 ? WalletCategory.Investor : WalletCategory.Community;
+
+        case AccountType.INSTITUTIONAL:
+          return WalletCategory.MarketMaker;
+
+        case AccountType.BOT_TRADER:
+          return WalletCategory.MarketMaker;
+      }
+    }
+
+    // Default: Regular community member
     return WalletCategory.Community;
   }
+
+  /** Lower-bound CEX/DEX split using only the top holders you already classify */
+  async getSupplySplitTop20(tokenMint: string): Promise<{
+    basis: "top20";
+    totalSupply: number;
+    cex: number;
+    dex: number;
+    onchainNonCexDex: number;
+    unknownRemainder: number;
+    cexPctOfTotal: number;
+    dexPctOfTotal: number;
+    onchainNonCexDexPctOfTotal: number;
+    unknownPctOfTotal: number;
+    breakdownByExchange: Record<string, number>;
+    dexName?: string;
+  }> {
+    const mintKey = typeof tokenMint === "string" ? new PublicKey(tokenMint) : tokenMint;
+    const mintInfo = await this.getMintInfo(mintKey);
+
+    console.log("Getting token holder classifications...");
+    const classifications = await this.classifyTokenHolders(tokenMint);
+
+    let cex = 0;
+    let dex = 0;
+    let onchain = 0;
+
+    const breakdownCex: Record<string, number> = {};
+    let primaryDexName: string | undefined;
+    let largestDexBalance = 0;
+
+    console.log(`Processing ${classifications.length} classified holders`);
+
+    for (const classification of classifications) {
+      const { balance, category, metadata } = classification;
+
+      const accountType = metadata?.accountType;
+      const label = metadata?.label?.toLowerCase();
+      const subType = metadata?.accountSubType;
+      const confidence = metadata?.classificationConfidence;
+
+      switch (accountType) {
+        case AccountType.CEX:
+          cex += balance;
+          const cexKey = label || subType || "exchange (unknown)";
+          const cexKeyWithConfidence = confidence !== 'high' ? `${cexKey} [${confidence}]` : cexKey;
+          breakdownCex[cexKeyWithConfidence] = (breakdownCex[cexKeyWithConfidence] || 0) + balance;
+          break;
+
+        case AccountType.DEX:
+          dex += balance;
+          if (balance > largestDexBalance) {
+            largestDexBalance = balance;
+            primaryDexName = label || subType || "dex (unknown)";
+          }
+          break;
+        case AccountType.BRIDGE:
+        case AccountType.STAKING:
+        case AccountType.VALIDATOR:
+        case AccountType.PROGRAM_AUTHORITY:
+        case AccountType.UNKNOWN:
+          if (category === WalletCategory.Exchange) {
+            cex += balance;
+            breakdownCex["exchange (behavioral)"] = (breakdownCex["exchange (behavioral)"] || 0) + balance;
+          } else if (category === WalletCategory.Dex) {
+            dex += balance;
+            if (balance > largestDexBalance) {
+              largestDexBalance = balance;
+              primaryDexName = "dex (behavioral)";
+            }
+          } else {
+            onchain += balance;
+          }
+          break;
+
+        default:
+          onchain += balance;
+          break;
+      }
+    }
+
+    const covered = cex + dex + onchain;
+    const unknownRemainder = Math.max(mintInfo.supply - covered, 0);
+
+    console.log(`Supply split summary:
+    CEX: ${(cex / mintInfo.supply * 100).toFixed(2)}%
+    DEX: ${(dex / mintInfo.supply * 100).toFixed(2)}%
+    On-chain: ${(onchain / mintInfo.supply * 100).toFixed(2)}%
+    Unknown: ${(unknownRemainder / mintInfo.supply * 100).toFixed(2)}%
+  `);
+
+    return {
+      basis: "top20",
+      totalSupply: mintInfo.supply,
+      cex,
+      dex,
+      onchainNonCexDex: onchain,
+      unknownRemainder,
+      cexPctOfTotal: (cex / mintInfo.supply) * 100,
+      dexPctOfTotal: (dex / mintInfo.supply) * 100,
+      onchainNonCexDexPctOfTotal: (onchain / mintInfo.supply) * 100,
+      unknownPctOfTotal: (unknownRemainder / mintInfo.supply) * 100,
+      breakdownByExchange: breakdownCex,
+      dexName: primaryDexName,
+    };
+  }
+
+  /** Accurate CEX/DEX split across the whole supply (all token accounts for the mint) */
+  async getSupplySplitFull(tokenMint: string): Promise<{
+    basis: "full";
+    totalSupply: number;
+    cex: number;
+    dex: number;
+    onchainNonCexDex: number;
+    cexPctOfTotal: number;
+    dexPctOfTotal: number;
+    onchainNonCexDexPctOfTotal: number;
+    breakdownByExchange: Record<string, number>;
+    dexName?: string;
+  }> {
+    const mintKey = typeof tokenMint === "string" ? new PublicKey(tokenMint) : tokenMint;
+    const mintInfo = await this.getMintInfo(mintKey);
+
+    const accounts = await this.connection.getParsedProgramAccounts(
+      TOKEN_PROGRAM_ID,
+      {
+        filters: [
+          { dataSize: 165 },
+          { memcmp: { offset: 0, bytes: mintKey.toBase58() } },
+        ],
+      },
+    );
+
+    console.log(`Found ${accounts.length} token accounts for mint ${tokenMint}`);
+
+    const perOwner = new Map<string, number>();
+    for (const acc of accounts) {
+      const data = acc.account.data as ParsedAccountData;
+      const info: any = data.parsed?.info;
+      if (!info) continue;
+
+      const owner: string = info.owner;
+      const amountStr: string = info.tokenAmount?.amount ?? "0";
+      const decimals: number = info.tokenAmount?.decimals ?? 0;
+      const ui = Number(BigInt(amountStr)) / Math.pow(10, decimals);
+      if (ui <= 0) continue;
+
+      perOwner.set(owner, (perOwner.get(owner) || 0) + ui);
+    }
+
+    const ownersSorted = Array.from(perOwner.entries()).sort(
+      (a, b) => b[1] - a[1],
+    );
+
+    console.log(`Processing ${ownersSorted.length} unique owners`);
+
+    let cex = 0;
+    let dex = 0;
+    let onchain = 0;
+
+    const breakdownCex: Record<string, number> = {};
+    let primaryDexName: string | undefined;
+    let largestDexBalance = 0;
+
+    const metadataCache = new Map<string, SolscanAccountData | null>();
+    const MAX_METADATA_CHECKS = 300;
+    const MIN_BALANCE_FOR_CHECK = mintInfo.supply * 0.0001;
+    const BATCH_SIZE = 10;
+
+    let metadataChecks = 0;
+    let batchCount = 0;
+
+    for (const [owner, balance] of ownersSorted) {
+      let ownerMetadata: SolscanAccountData | null = null;
+
+      const shouldCheckMetadata =
+        metadataChecks < MAX_METADATA_CHECKS &&
+        balance >= MIN_BALANCE_FOR_CHECK;
+
+      if (shouldCheckMetadata) {
+        if (metadataCache.has(owner)) {
+          ownerMetadata = metadataCache.get(owner)!;
+        } else {
+          try {
+            ownerMetadata = await this.getAccountMetadata(owner);
+            metadataCache.set(owner, ownerMetadata);
+            metadataChecks++;
+
+            if (++batchCount % BATCH_SIZE === 0) {
+              await new Promise((r) => setTimeout(r, 200));
+            }
+          } catch (error) {
+            console.warn(`Failed to get metadata for ${owner}:`, error);
+            metadataCache.set(owner, null);
+          }
+        }
+      }
+
+      const classification = AccountTypeClassifier.classifyAccount(ownerMetadata);
+
+      switch (classification.type) {
+        case AccountType.CEX:
+          cex += balance;
+          const breakdownKey = ownerMetadata?.account_label?.toLowerCase() ||
+            classification.subType || "exchange (unknown)";
+          const keyWithConfidence = classification.confidence !== 'high' ?
+            `${breakdownKey} [${classification.confidence}]` : breakdownKey;
+          breakdownCex[keyWithConfidence] = (breakdownCex[keyWithConfidence] || 0) + balance;
+          break;
+
+        case AccountType.DEX:
+          dex += balance;
+          if (balance > largestDexBalance) {
+            largestDexBalance = balance;
+            primaryDexName = ownerMetadata?.account_label?.toLowerCase() ||
+              classification.subType || "dex (unknown)";
+          }
+          break;
+
+        // REMOVED: All infrastructure cases now go to onchain
+        default:
+          onchain += balance;
+          break;
+      }
+
+      if (balance >= mintInfo.supply * 0.01) {
+        console.log(
+          `Large holder: ${owner.slice(0, 8)}... | ${balance.toLocaleString()} tokens (${(balance / mintInfo.supply * 100).toFixed(2)}%) | ${classification.type} (${classification.confidence})`
+        );
+      }
+    }
+
+    console.log(`Metadata checks performed: ${metadataChecks}/${ownersSorted.length}`);
+
+    const supply = mintInfo.supply;
+    return {
+      basis: "full",
+      totalSupply: supply,
+      cex,
+      dex,
+      onchainNonCexDex: onchain,
+      cexPctOfTotal: (cex / supply) * 100,
+      dexPctOfTotal: (dex / supply) * 100,
+      onchainNonCexDexPctOfTotal: (onchain / supply) * 100,
+      breakdownByExchange: breakdownCex,
+      dexName: primaryDexName,
+    };
+  }
+ async getSupplyAnalysis(
+  tokenMint: string
+): Promise<{
+  top20: Awaited<ReturnType<SolanaLib["getSupplySplitTop20"]>>;
+  full: Awaited<ReturnType<SolanaLib["getSupplySplitFull"]>>;
+  summary: {
+    totalHolders: number;
+    concentrationRisk: 'high' | 'medium' | 'low';
+    exchangeExposure: 'high' | 'medium' | 'low';
+    decentralizationScore: number; // 0-100
+    primaryDex?: string; // NEW: Name of the primary DEX
+  };
+}> {
+  console.log(`Starting comprehensive supply analysis for ${tokenMint}`);
+
+  const [top20, full] = await Promise.all([
+    this.getSupplySplitTop20(tokenMint),
+    this.getSupplySplitFull(tokenMint)
+  ]);
+
+  // Calculate risk metrics
+  const cexPct = full.cexPctOfTotal;
+  const concentrationRisk =
+    cexPct > 50 ? 'high' :
+    cexPct > 25 ? 'medium' : 'low';
+
+  const totalExchangePct = full.cexPctOfTotal + full.dexPctOfTotal;
+  const exchangeExposure =
+    totalExchangePct > 60 ? 'high' :
+    totalExchangePct > 30 ? 'medium' : 'low';
+
+  // Updated decentralization score (removed infrastructure calculation)
+  const decentralizationScore = Math.max(0, Math.min(100,
+    100 - cexPct // Simplified: just based on CEX concentration
+  ));
+
+  // Estimate total holders (simplified since we removed infrastructure breakdown)
+  const estimatedHolders = Object.keys(full.breakdownByExchange).length + 
+    (full.dexName ? 1 : 0) + // Count DEX if present
+    50; // Rough estimate for on-chain holders
+
+  return {
+    top20,
+    full,
+    summary: {
+      totalHolders: estimatedHolders,
+      concentrationRisk,
+      exchangeExposure,
+      decentralizationScore: Math.round(decentralizationScore),
+      primaryDex: full.dexName, // Include the primary DEX name
+    }
+  };
+}
+
+  /** CSV helpers */
+  private csvEscape(v: any): string {
+    if (v === null || v === undefined) return "";
+    const s = String(v);
+    // quote if contains comma, quote, newline, or leading/trailing spaces
+    if (/[",\n]|^\s|\s$/.test(s)) {
+      return `"${s.replace(/"/g, '""')}"`;
+    }
+    return s;
+  }
+
+  private csvRow(cells: any[]): string {
+    return cells.map((c) => this.csvEscape(c)).join(",");
+  }
+
+  private fmtDate(d?: Date | null): string {
+    if (!d) return "";
+    // ISO without ms for clean spreadsheets
+    return new Date(d).toISOString().replace(/\.\d{3}Z$/, "Z");
+  }
+
+  private async ensureDir(p: string) {
+    const dir = path.dirname(p);
+    await fs.mkdir(dir, { recursive: true });
+  }
+
+
+
+  public async generate(
+    tokenMint: string,
+    opts: GenerateOptions = {},
+  ): Promise<string> {
+    const mintKey =
+      typeof tokenMint === "string" ? new PublicKey(tokenMint) : tokenMint;
+
+    console.log(`Starting report generation for token: ${mintKey.toBase58()}`);
+
+    const mintInfo = await this.getMintInfo(mintKey);
+    const holders = (await this.getTopHolders(mintKey)) ?? [];
+    const classified = await this.classifyTokenHolders(mintKey.toBase58());
+    const splitTop20 = await this.getSupplySplitTop20(mintKey.toBase58());
+    const splitFull = opts.includeFullSplit
+      ? await this.getSupplySplitFull(mintKey.toBase58())
+      : undefined;
+
+    // Map classifications by wallet address (not token account)
+    const classByWallet = new Map<string, WalletClassification>();
+    for (const c of classified) {
+      classByWallet.set(c.address, c);
+    }
+
+    const lines: string[] = [];
+    lines.push(this.csvRow(["Section", "Key/Column", "Value/…"]));
+
+    // MintInfo Section
+    const mintSection: Array<[string, string | number | null]> = [
+      ["Mint Address", mintInfo.address],
+      ["Total Supply (UI)", mintInfo.supply],
+      ["Decimals", mintInfo.decimals],
+      ["Mint Authority", mintInfo.mintAuthority],
+      ["Freeze Authority", mintInfo.freezeAuthority],
+      ["Generated At (UTC)", this.fmtDate(new Date())],
+    ];
+    for (const [k, v] of mintSection) {
+      lines.push(this.csvRow(["MintInfo", k, v]));
+    }
+
+    lines.push(this.csvRow(["", "", ""]));
+
+    // SupplySplitTop20 Section
+    this.addSupplySplitSection(lines, "SupplySplitTop20", splitTop20);
+
+    // SupplySplitFull Section (if enabled)
+    if (splitFull) {
+      lines.push(this.csvRow(["", "", ""]));
+      this.addSupplySplitSection(lines, "SupplySplitFull", splitFull);
+    }
+
+    lines.push(this.csvRow(["", "", ""]));
+
+    // Enhanced Holders Section
+    lines.push(
+      this.csvRow([
+        "Section",
+        "#",
+        "TokenAccount",
+        "Owner",
+        "Category",
+        "AccountType",
+        "SubType",
+        "Confidence",
+        "Balance(UI)",
+        "% of Total Supply",
+        "TxCount",
+        "FirstTx(UTC)",
+        "LastTx(UTC)",
+        "HasSold",
+        "DiamondHand(>=90d & no sell)",
+        "NoOutflow180d",
+        "Label",
+        "Tags",
+        "ActiveAgeDays",
+        "FundedBy",
+        // Legacy fields for backward compatibility
+        "isDEX",
+        "isCEX",
+      ]),
+    );
+
+    const sortedHolders = [...holders].sort((a, b) => b.balance - a.balance);
+    const supplyRaw = mintInfo.raw.supply;
+
+    sortedHolders.forEach((h, idx) => {
+      // Look up classification by wallet address
+      const cls = classByWallet.get(h.walletAddress);
+      const pctSupply = this.getSupplyPct(h.rawBalance, supplyRaw);
+
+      lines.push(
+        this.csvRow([
+          "Holders",
+          String(idx + 1),
+          h.tokenAccount,
+          cls?.metadata?.owner ?? h.walletAddress ?? "",
+          cls?.category ?? WalletCategory.Community,
+          cls?.metadata?.accountType ?? AccountType.UNKNOWN,
+          cls?.metadata?.accountSubType ?? "",
+          cls?.metadata?.classificationConfidence ?? "",
+          h.balance,
+          pctSupply.toFixed(2),
+          cls?.transactionCount ?? "",
+          this.fmtDate(cls?.firstTransactionDate),
+          this.fmtDate(cls?.lastTransactionDate),
+          cls?.hasSold ?? "",
+          cls?.isDiamondHand ?? "",
+          cls?.isLongTermNoOutflow180 ?? "",
+          cls?.metadata?.label ?? "",
+          cls?.metadata?.accountTags?.join("; ") ?? "",
+          cls?.metadata?.activeAgeDays ?? "",
+          cls?.metadata?.fundedBy?.address ?? "",
+          // Legacy fields
+          cls?.metadata?.isDex ?? false,
+          cls?.metadata?.isCex ?? false,
+        ]),
+      );
+    });
+
+    // Add Classification Summary Section
+    lines.push(this.csvRow(["", "", ""]));
+    this.addClassificationSummary(lines, classified, mintInfo.supply);
+    lines.push(this.csvRow(["", "", ""]));
+
+    // Generate file
+    const ts = new Date().toISOString().replace(/[:.Z]/g, "").slice(0, 15);
+    const safeMint = mintInfo.address;
+    const outPath =
+      opts.outPath ?? path.resolve("./reports", `${safeMint}_${ts}.csv`);
+
+    await this.ensureDir(outPath);
+    await fs.writeFile(outPath, lines.join("\n"), "utf8");
+
+    console.log(`\nCSV report written to: ${outPath}`);
+    console.log(`Report contains ${classified.length} classified holders`);
+    return outPath;
+  }
+
+  // Helper method to add supply split sections with infrastructure support
+  private addSupplySplitSection(
+    lines: string[],
+    sectionName: string,
+    split: any
+  ): void {
+    lines.push(this.csvRow([sectionName, "Total Supply (UI)", split.totalSupply]));
+
+    // Add CEX with percentage in brackets
+    const cexWithPct = `${split.cex} (${split.cexPctOfTotal.toFixed(2)}%)`;
+    lines.push(this.csvRow([sectionName, "CEX", cexWithPct]));
+
+    // Add DEX with percentage and name in brackets
+    const dexName = split.dexName ? ` - ${split.dexName}` : '';
+    const dexWithPct = `${split.dex} (${split.dexPctOfTotal.toFixed(2)}%)${dexName}`;
+    lines.push(this.csvRow([sectionName, "DEX", dexWithPct]));
+
+    // REMOVED: Infrastructure line
+
+    // Add On-chain with percentage
+    const onchainWithPct = `${split.onchainNonCexDex} (${split.onchainNonCexDexPctOfTotal.toFixed(2)}%)`;
+    lines.push(this.csvRow([sectionName, "On-chain non-CEX/DEX", onchainWithPct]));
+
+    // Add unknown remainder for Top20 with percentage
+    if ('unknownRemainder' in split) {
+      const unknownWithPct = `${split.unknownRemainder} (${split.unknownPctOfTotal.toFixed(2)}%)`;
+      lines.push(this.csvRow([sectionName, "Unknown Remainder", unknownWithPct]));
+    }
+
+    // REMOVED: All percentage rows (now inline)
+
+    // Keep CEX breakdowns
+    for (const [name, amt] of Object.entries(split.breakdownByExchange as Record<string, number>).sort((a, b) => b[1] - a[1])) {
+      const pct = ((amt / split.totalSupply) * 100).toFixed(2);
+      lines.push(this.csvRow([`${sectionName}:BreakdownCEX`, name, `${amt} (${pct}%)`]));
+    }
+
+  }
+
+  // Helper method to add classification summary
+  private addClassificationSummary(
+    lines: string[],
+    classifications: WalletClassification[],
+    totalSupply: number
+  ): void {
+    lines.push(this.csvRow(["ClassificationSummary", "Metric", "Count", "Total Balance", "% of Supply"]));
+
+    // Summary by WalletCategory
+    const categoryStats = new Map<WalletCategory, { count: number; balance: number }>();
+
+    for (const c of classifications) {
+      const current = categoryStats.get(c.category) || { count: 0, balance: 0 };
+      categoryStats.set(c.category, {
+        count: current.count + 1,
+        balance: current.balance + c.balance
+      });
+    }
+
+    for (const [category, stats] of categoryStats.entries()) {
+      const pct = (stats.balance / totalSupply * 100).toFixed(2);
+      lines.push(this.csvRow([
+        "ClassificationSummary",
+        `Category: ${category}`,
+        stats.count,
+        stats.balance.toFixed(6),
+        pct
+      ]));
+    }
+
+    lines.push(this.csvRow(["", "", "", "", ""]));
+
+    // Summary by AccountType
+    const typeStats = new Map<AccountType, { count: number; balance: number }>();
+
+    for (const c of classifications) {
+      const accountType = c.metadata?.accountType || AccountType.UNKNOWN;
+      const current = typeStats.get(accountType) || { count: 0, balance: 0 };
+      typeStats.set(accountType, {
+        count: current.count + 1,
+        balance: current.balance + c.balance
+      });
+    }
+
+    for (const [type, stats] of typeStats.entries()) {
+      const pct = (stats.balance / totalSupply * 100).toFixed(2);
+      lines.push(this.csvRow([
+        "ClassificationSummary",
+        `AccountType: ${type}`,
+        stats.count,
+        stats.balance.toFixed(6),
+        pct
+      ]));
+    }
+  }
+
 }
