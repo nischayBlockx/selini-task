@@ -10,10 +10,16 @@ import {
   WalletHistorySummary,
   ClassifyWalletContext,
   SolscanAccountData,
+
 } from "../common/interface";
 import {
   WalletCategory,
-  AccountType
+  AccountType,
+  DEFAULT_LOCK_LABEL_KEYWORDS,
+  EXTRA_TOKEN_PROGRAM_IDS,
+  FrozenAccountEntry,
+  LabeledOwnerEntry,
+  LockBreakdown
 } from "../common/constants";
 import { CONFIG } from "../config/config";
 import * as fs from "node:fs/promises";
@@ -605,6 +611,208 @@ export class SolanaLib {
     };
   }
 
+  /** Get parsed token accounts for a mint across one or more token programs.
+ * Uses TOKEN_PROGRAM_ID plus any extra program IDs provided in CONFIG.EXTRA_TOKEN_PROGRAM_IDS
+ */
+private async getParsedTokenAccountsForMint(mintKey: PublicKey) {
+  const programIds: PublicKey[] = [
+    TOKEN_PROGRAM_ID,
+    ...(EXTRA_TOKEN_PROGRAM_IDS?.map((s: string) => new PublicKey(s)) || []),
+  ];
+
+  const results: Array<{
+    programId: PublicKey;
+    accountPubkey: PublicKey;
+    data: ParsedAccountData;
+  }> = [];
+
+  for (const pid of programIds) {
+    const accounts = await this.connection.getParsedProgramAccounts(pid, {
+      filters: [
+        { dataSize: 165 },
+        { memcmp: { offset: 0, bytes: mintKey.toBase58() } },
+      ],
+    });
+
+    for (const a of accounts) {
+      results.push({
+        programId: pid,
+        accountPubkey: a.pubkey,
+        data: a.account.data as ParsedAccountData,
+      });
+    }
+  }
+  return results;
+}
+
+/** Sum balances of token accounts whose parsed.state is Frozen (case-insensitive). */
+private async getFrozenSupplyAndAccounts(mintKey: PublicKey): Promise<{
+  totalFrozen: number;
+  entries: FrozenAccountEntry[];
+  perOwnerFrozenMap: Map<string, number>;
+}> {
+  const accounts = await this.getParsedTokenAccountsForMint(mintKey);
+
+  let totalFrozen = 0;
+  const entries: FrozenAccountEntry[] = [];
+  const perOwnerFrozenMap = new Map<string, number>();
+
+  for (const { accountPubkey, data } of accounts) {
+    const info: any = data.parsed?.info;
+    if (!info) continue;
+
+    const state: string = (info.state || info.accountState || "").toString().toLowerCase();
+    if (state !== "frozen") continue;
+
+    const owner: string = info.owner;
+    const amountStr: string = info.tokenAmount?.amount ?? "0";
+    const decimals: number = info.tokenAmount?.decimals ?? 0;
+    const raw = BigInt(amountStr);
+    const ui = Number(raw) / Math.pow(10, decimals);
+    if (ui <= 0) continue;
+
+    totalFrozen += ui;
+    entries.push({
+      tokenAccount: accountPubkey.toBase58(),
+      owner,
+      balance: ui,
+      raw,
+      decimals,
+    });
+    perOwnerFrozenMap.set(owner, (perOwnerFrozenMap.get(owner) || 0) + ui);
+  }
+
+  return { totalFrozen, entries, perOwnerFrozenMap };
+}
+
+/** Heuristic: treat owners whose Solscan label/tags include vesting/lock keywords as locked.
+ * To avoid double-counting, we later subtract any portion already counted as "frozen".
+ */
+private async estimateLockedByLabelsExcludingFrozen(
+  mintKey: PublicKey,
+  perOwnerFrozenMap: Map<string, number>,
+  totalSupply: number
+): Promise<{
+  labeledOwners: LabeledOwnerEntry[];
+  labeledTotalEffective: number; // sum of effectiveLocked (excludes frozen already counted)
+}> {
+  const accounts = await this.getParsedTokenAccountsForMint(mintKey);
+
+  // Aggregate balances per owner (UI)
+  const perOwner = new Map<string, number>();
+  for (const { data } of accounts) {
+    const info: any = data.parsed?.info;
+    if (!info) continue;
+    const owner: string = info.owner;
+    const amountStr: string = info.tokenAmount?.amount ?? "0";
+    const decimals: number = info.tokenAmount?.decimals ?? 0;
+    const ui = Number(BigInt(amountStr)) / Math.pow(10, decimals);
+    if (ui <= 0) continue;
+    perOwner.set(owner, (perOwner.get(owner) || 0) + ui);
+  }
+
+  // Only fetch metadata for material holders to limit API calls
+  const MIN_BALANCE_FOR_CHECK = totalSupply * 0.0001; // 1 bps of supply
+  const holdersSorted = Array.from(perOwner.entries()).sort((a, b) => b[1] - a[1]);
+
+  const keywords = (DEFAULT_LOCK_LABEL_KEYWORDS && DEFAULT_LOCK_LABEL_KEYWORDS.length > 0)
+    ? DEFAULT_LOCK_LABEL_KEYWORDS.map((k: string) => k.toLowerCase())
+    : DEFAULT_LOCK_LABEL_KEYWORDS;
+
+  const labeledOwners: LabeledOwnerEntry[] = [];
+  let labeledTotalEffective = 0;
+
+  let checks = 0;
+  const MAX_CHECKS = 300;
+  const BATCH = 10;
+  let batchCount = 0;
+
+  for (const [owner, balance] of holdersSorted) {
+    if (checks >= MAX_CHECKS) break;
+    if (balance < MIN_BALANCE_FOR_CHECK) break;
+
+    let metadata: any = null;
+    try {
+      metadata = await this.getAccountMetadata(owner);
+      checks++;
+      if (++batchCount % BATCH === 0) {
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    } catch (_) {
+      metadata = null;
+    }
+
+    const label = metadata?.account_label?.toLowerCase?.() || null;
+    const tags: string[] = (metadata?.account_tags || []).map((t: string) => t.toLowerCase());
+    const haystack = [label || "", ...tags].join(" ");
+
+    let matched = "";
+    for (const kw of keywords) {
+      if (kw && haystack.includes(kw)) {
+        matched = kw;
+        break;
+      }
+    }
+    if (!matched) continue;
+
+    const frozenPortion = perOwnerFrozenMap.get(owner) || 0;
+    const effectiveLocked = Math.max(0, balance - frozenPortion); // avoid double-counting
+
+    labeledOwners.push({
+      owner,
+      label: metadata?.account_label || null,
+      tags: metadata?.account_tags || [],
+      balance,
+      frozenPortion,
+      effectiveLocked,
+      matchedBy: matched,
+    });
+
+    labeledTotalEffective += effectiveLocked;
+  }
+
+  return { labeledOwners, labeledTotalEffective };
+}
+
+/** High-level lock breakdown: Frozen + (heuristic) LabeledVesting; Circulating = Total - Locked */
+public async getLockBreakdown(tokenMint: string): Promise<LockBreakdown> {
+  const mintKey = typeof tokenMint === "string" ? new PublicKey(tokenMint) : tokenMint;
+  const mintInfo = await this.getMintInfo(mintKey);
+
+  // A) on-chain enforced locks (Frozen)
+  const { totalFrozen, entries: frozenEntries, perOwnerFrozenMap } =
+    await this.getFrozenSupplyAndAccounts(mintKey);
+
+  // B) heuristic vesting/escrow via labels/tags; exclude frozen portion
+  const { labeledOwners, labeledTotalEffective } =
+    await this.estimateLockedByLabelsExcludingFrozen(mintKey, perOwnerFrozenMap, mintInfo.supply);
+
+  const lockedTotal = totalFrozen + labeledTotalEffective;
+  const circulating = Math.max(0, mintInfo.supply - lockedTotal);
+
+  const notes = [
+    "Frozen = token accounts with state=frozen (on-chain enforced).",
+    "LabeledVesting = owners whose Solscan label/tags match vesting/lock keywords; frozen portion excluded to prevent double-count.",
+    "This heuristic will miss bespoke vesting contracts unless their owners are labeled (configure CONFIG.LOCK_LABEL_KEYWORDS or add program-specific parsers).",
+  ];
+
+  return {
+    totalSupply: mintInfo.supply,
+    lockedTotal,
+    circulating,
+    components: {
+      frozen: totalFrozen,
+      labeledVesting: labeledTotalEffective,
+    },
+    details: {
+      frozenAccounts: frozenEntries.sort((a, b) => b.balance - a.balance),
+      labeledOwners: labeledOwners.sort((a, b) => b.effectiveLocked - a.effectiveLocked),
+    },
+    notes,
+  };
+}
+
+
   async getSupplySplitFull(tokenMint: string): Promise<{
     basis: "full";
     totalSupply: number;
@@ -876,6 +1084,48 @@ export class SolanaLib {
       lines.push(this.csvRow(["", "", ""]));
       this.addSupplySplitSection(lines, "SupplySplitFull", splitFull);
     }
+
+        // --- NEW: Lock / Circulating summary ---
+    const lockStats = await this.getLockBreakdown(mintKey.toBase58());
+
+    lines.push(this.csvRow(["", "", ""]));
+    lines.push(this.csvRow(["LockSummary", "Total Supply (UI)", lockStats.totalSupply]));
+    lines.push(this.csvRow(["LockSummary", "Locked (Total)", lockStats.lockedTotal]));
+    lines.push(this.csvRow(["LockSummary", "Circulating (Est.)", lockStats.circulating]));
+    lines.push(this.csvRow(["LockSummary", "Frozen (on-chain)", lockStats.components.frozen]));
+    lines.push(this.csvRow(["LockSummary", "LabeledVesting (heuristic, excl. frozen)", lockStats.components.labeledVesting]));
+
+    // Details: top frozen token accounts
+    const topFrozen = lockStats.details.frozenAccounts.slice(0, 20);
+    for (const f of topFrozen) {
+      lines.push(this.csvRow([
+        "LockSummary:FrozenAccounts",
+        f.tokenAccount,
+        f.owner,
+        f.balance
+      ]));
+    }
+
+    // Details: top labeled vesting owners
+    const topLabeled = lockStats.details.labeledOwners.slice(0, 20);
+    for (const l of topLabeled) {
+      lines.push(this.csvRow([
+        "LockSummary:LabeledOwners",
+        l.owner,
+        l.label || "",
+        `${l.balance}`,                    // total owner balance
+        `${l.frozenPortion}`,              // of which frozen
+        `${l.effectiveLocked}`,            // counted as "labeled lock"
+        l.matchedBy,
+        (l.tags || []).join("; ")
+      ]));
+    }
+
+    // Notes
+    for (const n of lockStats.notes) {
+      lines.push(this.csvRow(["LockSummary:Notes", "", n]));
+    }
+
 
     lines.push(this.csvRow(["", "", ""]));
 
