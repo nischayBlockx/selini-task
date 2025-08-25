@@ -13,8 +13,6 @@ import {
 } from "../common/interface";
 import {
   WalletCategory,
-  DEX_KEYWORDS,
-  CEX_KEYWORDS,
   AccountType
 } from "../common/constants";
 import { CONFIG } from "../config/config";
@@ -58,8 +56,6 @@ export class SolanaLib {
   ): Promise<HolderInfo[] | null> {
     const mintKey =
       typeof mintAddr === "string" ? new PublicKey(mintAddr) : mintAddr;
-
-    // RPC returns up to 20 token accounts sorted by balance (largest first)
     const { value } = await this.connection.getTokenLargestAccounts(mintKey);
 
     // Filter out zero balances
@@ -75,8 +71,8 @@ export class SolanaLib {
 
         const raw = BigInt(entry.amount);
         return {
-          tokenAccount: tokenAccountAddress, // token account
-          walletAddress, // owner wallet
+          tokenAccount: tokenAccountAddress,
+          walletAddress, 
           rawBalance: raw,
           balance: Number(raw) / 10 ** entry.decimals,
           decimals: entry.decimals,
@@ -86,26 +82,6 @@ export class SolanaLib {
 
     return holders;
   }
-
-  // account labeling : https://docs.solscan.io/transaction-details/labeling
-  // using Solscan's metadata API
-  // async getAccountLabel(address: string): Promise<string | null> {
-  //   try {
-  //     const { data } = await axios.get<SolscanMetaDataResponse>(
-  //       "https://pro-api.solscan.io/v2.0/account/metadata",
-  //       {
-  //         params: { address },
-  //         headers: { token: CONFIG.SOLSCAN_API_KEY },
-  //       },
-  //     );
-  //     // Only return when the call itself succeeded and a label exists
-  //     return data.success && data.data?.account_label
-  //       ? data.data.account_label
-  //       : null;
-  //   } catch (err) {
-  //     return null;
-  //   }
-  // }
 
   async getTokenAccountOwner(tokenAccount: string): Promise<string> {
     try {
@@ -350,7 +326,7 @@ export class SolanaLib {
       while (allTransfers.length < 1000) {
         const params: any = {
           address: ownerAddress, // OWNER-level aggregation
-          token: tokenMint, // filter by this mint
+          token: tokenMint, 
           activity_type: activityTypes,
           exclude_amount_zero: true,
           sort_by: "block_time",
@@ -359,8 +335,7 @@ export class SolanaLib {
           page_size: pageSize,
         };
 
-        // IMPORTANT: do NOT set params.token_account (we want all accounts owned by the wallet)
-
+      
         const { data } = await axios.get(url, { headers, params });
         if (!data?.success) break;
 
@@ -372,7 +347,6 @@ export class SolanaLib {
         if (items.length < pageSize) break;
         page += 1;
 
-        // gentle rate limit
         await new Promise((r) => setTimeout(r, 200));
       }
 
@@ -631,7 +605,6 @@ export class SolanaLib {
     };
   }
 
-  /** Accurate CEX/DEX split across the whole supply (all token accounts for the mint) */
   async getSupplySplitFull(tokenMint: string): Promise<{
     basis: "full";
     totalSupply: number;
@@ -929,7 +902,6 @@ export class SolanaLib {
         "Tags",
         "ActiveAgeDays",
         "FundedBy",
-        // Legacy fields for backward compatibility
         "isDEX",
         "isCEX",
       ]),
@@ -939,7 +911,6 @@ export class SolanaLib {
     const supplyRaw = mintInfo.raw.supply;
 
     sortedHolders.forEach((h, idx) => {
-      // Look up classification by wallet address
       const cls = classByWallet.get(h.walletAddress);
       const pctSupply = this.getSupplyPct(h.rawBalance, supplyRaw);
 
@@ -965,7 +936,6 @@ export class SolanaLib {
           cls?.metadata?.accountTags?.join("; ") ?? "",
           cls?.metadata?.activeAgeDays ?? "",
           cls?.metadata?.fundedBy?.address ?? "",
-          // Legacy fields
           cls?.metadata?.isDex ?? false,
           cls?.metadata?.isCex ?? false,
         ]),
@@ -991,7 +961,6 @@ export class SolanaLib {
     return outPath;
   }
 
-  // Helper method to add supply split sections with infrastructure support
   private addSupplySplitSection(
     lines: string[],
     sectionName: string,
@@ -999,30 +968,22 @@ export class SolanaLib {
   ): void {
     lines.push(this.csvRow([sectionName, "Total Supply (UI)", split.totalSupply]));
 
-    // Add CEX with percentage in brackets
+
     const cexWithPct = `${split.cex} (${split.cexPctOfTotal.toFixed(2)}%)`;
     lines.push(this.csvRow([sectionName, "CEX", cexWithPct]));
 
-    // Add DEX with percentage and name in brackets
     const dexName = split.dexName ? ` - ${split.dexName}` : '';
     const dexWithPct = `${split.dex} (${split.dexPctOfTotal.toFixed(2)}%)${dexName}`;
     lines.push(this.csvRow([sectionName, "DEX", dexWithPct]));
 
-    // REMOVED: Infrastructure line
-
-    // Add On-chain with percentage
     const onchainWithPct = `${split.onchainNonCexDex} (${split.onchainNonCexDexPctOfTotal.toFixed(2)}%)`;
     lines.push(this.csvRow([sectionName, "On-chain non-CEX/DEX", onchainWithPct]));
 
-    // Add unknown remainder for Top20 with percentage
     if ('unknownRemainder' in split) {
       const unknownWithPct = `${split.unknownRemainder} (${split.unknownPctOfTotal.toFixed(2)}%)`;
       lines.push(this.csvRow([sectionName, "Unknown Remainder", unknownWithPct]));
     }
 
-    // REMOVED: All percentage rows (now inline)
-
-    // Keep CEX breakdowns
     for (const [name, amt] of Object.entries(split.breakdownByExchange as Record<string, number>).sort((a, b) => b[1] - a[1])) {
       const pct = ((amt / split.totalSupply) * 100).toFixed(2);
       lines.push(this.csvRow([`${sectionName}:BreakdownCEX`, name, `${amt} (${pct}%)`]));
@@ -1030,7 +991,6 @@ export class SolanaLib {
 
   }
 
-  // Helper method to add classification summary
   private addClassificationSummary(
     lines: string[],
     classifications: WalletClassification[],
@@ -1038,7 +998,7 @@ export class SolanaLib {
   ): void {
     lines.push(this.csvRow(["ClassificationSummary", "Metric", "Count", "Total Balance", "% of Supply"]));
 
-    // Summary by WalletCategory
+
     const categoryStats = new Map<WalletCategory, { count: number; balance: number }>();
 
     for (const c of classifications) {
@@ -1062,7 +1022,6 @@ export class SolanaLib {
 
     lines.push(this.csvRow(["", "", "", "", ""]));
 
-    // Summary by AccountType
     const typeStats = new Map<AccountType, { count: number; balance: number }>();
 
     for (const c of classifications) {
